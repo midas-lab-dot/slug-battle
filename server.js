@@ -1,0 +1,470 @@
+// ============================================================
+// CRYPTO PORTFOLIO BATTLE — Backend Server v3 (PostgreSQL)
+// ============================================================
+
+const express = require('express');
+const { Pool } = require('pg');
+const cors    = require('cors');
+const crypto  = require('crypto');
+
+const app = express();
+app.use(express.json());
+app.use(cors());
+
+const CONFIG = {
+  BOT_TOKEN:       process.env.BOT_TOKEN       || 'YOUR_BOT_TOKEN',
+  ADMIN_KEY:       process.env.ADMIN_KEY        || 'slug-admin-2024',
+  FRONTEND_URL:    process.env.FRONTEND_URL     || 'https://slug-token.netlify.app/battle',
+  SLUG_CONTRACT:   'axm1nzvd5njkc0gqdezgzzqw00tu056rgxgwaqgq25g9ku0y5au3nwmqxqtr0l',
+  PROJECT_WALLET:  'axm1fnhlykzpra0j6xzy0eenpfwn7anp5upm2jxm9k',
+  AXIOME_REST:     'https://api-chain.axiomechain.org',
+  NETWORK:         'axiome',
+  FEE_PERCENT:     2,
+  PORT:            process.env.PORT || 3000,
+  ESCROW_CONTRACT: process.env.ESCROW_CONTRACT || '',
+  MIN_STAKE:       100,
+  PAYMENT_TIMEOUT_SEC: 900,
+  KNOWN_TOKENS: [
+    { contract: 'axm1nzvd5njkc0gqdezgzzqw00tu056rgxgwaqgq25g9ku0y5au3nwmqxqtr0l', symbol: 'SLUG', decimals: 6 },
+  ],
+};
+
+// ── PostgreSQL ────────────────────────────────────────────────
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
+});
+
+async function q(sql, params = []) {
+  const client = await pool.connect();
+  try { return await client.query(sql, params); }
+  finally { client.release(); }
+}
+
+async function initDB() {
+  await q(`CREATE TABLE IF NOT EXISTS battles (
+    id TEXT PRIMARY KEY, creator TEXT NOT NULL, stake BIGINT NOT NULL,
+    max_players INTEGER NOT NULL, duration_ms BIGINT NOT NULL,
+    status TEXT DEFAULT 'open',
+    created_at BIGINT DEFAULT EXTRACT(EPOCH FROM NOW()),
+    started_at BIGINT, ends_at BIGINT, winner TEXT, pool_total BIGINT DEFAULT 0
+  )`);
+  await q(`CREATE TABLE IF NOT EXISTS participants (
+    id SERIAL PRIMARY KEY, battle_id TEXT NOT NULL, wallet TEXT NOT NULL,
+    tg_user_id TEXT, tg_username TEXT,
+    joined_at BIGINT DEFAULT EXTRACT(EPOCH FROM NOW()),
+    portfolio_start TEXT, portfolio_end TEXT, growth_pct REAL,
+    paid INTEGER DEFAULT 0, UNIQUE(battle_id, wallet)
+  )`);
+  await q(`CREATE TABLE IF NOT EXISTS pending_payments (
+    id SERIAL PRIMARY KEY, battle_id TEXT NOT NULL, wallet TEXT NOT NULL,
+    amount BIGINT NOT NULL, memo TEXT NOT NULL UNIQUE,
+    created_at BIGINT DEFAULT EXTRACT(EPOCH FROM NOW()), verified INTEGER DEFAULT 0
+  )`);
+  await q(`CREATE TABLE IF NOT EXISTS seen_txs (
+    tx_hash TEXT PRIMARY KEY, seen_at BIGINT DEFAULT EXTRACT(EPOCH FROM NOW())
+  )`);
+  await q(`CREATE INDEX IF NOT EXISTS idx_pending_verified ON pending_payments(verified)`);
+  await q(`CREATE INDEX IF NOT EXISTS idx_participants_paid ON participants(battle_id, paid)`);
+  await q(`CREATE INDEX IF NOT EXISTS idx_battles_status ON battles(status)`);
+  console.log('[db] PostgreSQL ready');
+}
+
+// ── Axiome API ────────────────────────────────────────────────
+async function getCW20Balance(wallet, contract) {
+  try {
+    const qb  = Buffer.from(JSON.stringify({ balance: { address: wallet } })).toString('base64');
+    const res = await fetch(`${CONFIG.AXIOME_REST}/cosmwasm/wasm/v1/contract/${contract}/smart/${qb}`, { signal: AbortSignal.timeout(6000) });
+    return parseInt((await res.json())?.data?.balance || '0');
+  } catch { return 0; }
+}
+
+async function getNativeBalance(wallet) {
+  try {
+    const res  = await fetch(`${CONFIG.AXIOME_REST}/cosmos/bank/v1beta1/balances/${wallet}`, { signal: AbortSignal.timeout(6000) });
+    return parseInt((await res.json())?.balances?.find(b => b.denom === 'uaxm')?.amount || '0');
+  } catch { return 0; }
+}
+
+async function getFullPortfolio(wallet) {
+  const portfolio = { AXM: { symbol: 'AXM', amount: (await getNativeBalance(wallet)) / 1e6, contract: 'native' } };
+  for (const t of CONFIG.KNOWN_TOKENS) {
+    portfolio[t.symbol] = { symbol: t.symbol, amount: (await getCW20Balance(wallet, t.contract)) / Math.pow(10, t.decimals), contract: t.contract };
+  }
+  return portfolio;
+}
+
+async function getTokenPrices() {
+  const prices = { SLUG: 0.008, AXM: 0.004 };
+  try {
+    const data = await (await fetch('https://api.coingecko.com/api/v3/simple/price?ids=axiome&vs_currencies=usd', { signal: AbortSignal.timeout(4000) })).json();
+    prices.AXM = data?.axiome?.usd || 0.004;
+  } catch {}
+  return prices;
+}
+
+async function calcPortfolioUsd(portfolio, prices) {
+  return Object.values(portfolio).reduce((t, d) => t + d.amount * (prices[d.symbol] || 0), 0);
+}
+
+// ── QR builders ───────────────────────────────────────────────
+function buildQR(recipient, amountSlug, memo) {
+  return `axiomesign://${Buffer.from(JSON.stringify({
+    type: 'cosmwasm_execute', network: CONFIG.NETWORK, contract_addr: CONFIG.SLUG_CONTRACT, funds: [],
+    msg: { transfer: { recipient, amount: String(Math.round(amountSlug * 1e6)) } }, memo,
+  })).toString('base64')}`;
+}
+
+function buildEscrowJoinQR(battleId, amountSlug) {
+  const hookMsg = Buffer.from(JSON.stringify({ join_battle: { battle_id: battleId } })).toString('base64');
+  return `axiomesign://${Buffer.from(JSON.stringify({
+    type: 'cosmwasm_execute', network: CONFIG.NETWORK, contract_addr: CONFIG.SLUG_CONTRACT, funds: [],
+    msg: { send: { contract: CONFIG.ESCROW_CONTRACT, amount: String(Math.round(amountSlug * 1e6)), msg: hookMsg } },
+    memo: `JOIN:${battleId}`,
+  })).toString('base64')}`;
+}
+
+function buildJoinQR(battleId, amountSlug, memo) {
+  return CONFIG.ESCROW_CONTRACT ? buildEscrowJoinQR(battleId, amountSlug) : buildQR(CONFIG.PROJECT_WALLET, amountSlug, memo);
+}
+
+// ── Telegram ──────────────────────────────────────────────────
+async function sendTg(chatId, text, extra = {}) {
+  if (!chatId || CONFIG.BOT_TOKEN === 'YOUR_BOT_TOKEN') return;
+  try {
+    await fetch(`https://api.telegram.org/bot${CONFIG.BOT_TOKEN}/sendMessage`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: chatId, text, parse_mode: 'HTML', ...extra }),
+    });
+  } catch {}
+}
+
+async function notifyWinner(battle, winner, prize) {
+  const p = (await q('SELECT tg_user_id FROM participants WHERE battle_id=$1 AND wallet=$2', [battle.id, winner])).rows[0];
+  if (!p?.tg_user_id) return;
+  const qr = buildQR(winner, prize, `WIN:${battle.id}`);
+  await sendTg(p.tg_user_id, `🏆 <b>Ты победил!</b>\n\nБитва: <b>#${battle.id}</b>\nПриз: <b>${prize.toLocaleString()} SLUG</b>\n\nОткрой Axiome Wallet → Connect → вставь строку:`);
+  await sendTg(p.tg_user_id, `<code>${qr}</code>`);
+}
+
+async function notifyWinnerAuto(battle, winner, prize) {
+  const p = (await q('SELECT tg_user_id FROM participants WHERE battle_id=$1 AND wallet=$2', [battle.id, winner])).rows[0];
+  if (!p?.tg_user_id) return;
+  await sendTg(p.tg_user_id, `🏆 <b>Ты победил!</b>\n\nБитва: <b>#${battle.id}</b>\nПриз: <b>${prize.toLocaleString()} SLUG</b>\n\n💰 Токены уже на твоём кошельке!`);
+}
+
+async function callEscrowFinalize(battleId, winner) {
+  const qr = `axiomesign://${Buffer.from(JSON.stringify({
+    type: 'cosmwasm_execute', network: CONFIG.NETWORK, contract_addr: CONFIG.ESCROW_CONTRACT, funds: [],
+    msg: { finalize: { battle_id: battleId, winner } }, memo: `FINALIZE:${battleId}`,
+  })).toString('base64')}`;
+  const adminId = process.env.ADMIN_TG_ID;
+  if (adminId) {
+    await sendTg(adminId, `🔑 <b>Финализация #${battleId}</b>\nПобедитель: <code>${winner}</code>\n\nВставь в Axiome Connect:`);
+    await sendTg(adminId, `<code>${qr}</code>`);
+  }
+}
+
+// ── Payment watcher ───────────────────────────────────────────
+async function getRecentIncomingTxs() {
+  try {
+    const url = `${CONFIG.AXIOME_REST}/cosmos/tx/v1beta1/txs?events=wasm._contract_address%3D%27${CONFIG.SLUG_CONTRACT}%27&events=wasm.recipient%3D%27${CONFIG.PROJECT_WALLET}%27&order_by=ORDER_DESC&limit=30`;
+    return (await (await fetch(url, { signal: AbortSignal.timeout(8000) })).json())?.txs || [];
+  } catch (e) { console.error('[watcher]', e.message); return []; }
+}
+
+function parseBattleMemo(memo) {
+  if (!memo?.startsWith('BATTLE:')) return null;
+  const i1 = memo.indexOf(':'), i2 = memo.indexOf(':', i1 + 1);
+  if (i2 === -1) return null;
+  const battleId = memo.slice(i1 + 1, i2), wallet = memo.slice(i2 + 1);
+  return (battleId && wallet.startsWith('axm1')) ? { battleId, wallet } : null;
+}
+
+function extractTransferAmount(tx) {
+  try {
+    for (const ev of tx.logs?.[0]?.events || []) {
+      if (ev.type !== 'wasm') continue;
+      const attrs = Object.fromEntries(ev.attributes.map(a => [a.key, a.value]));
+      if (attrs.recipient === CONFIG.PROJECT_WALLET && attrs.amount) return parseInt(attrs.amount);
+    }
+    return null;
+  } catch { return null; }
+}
+
+async function confirmPayment(battleId, wallet, txHash, paidAmount) {
+  try { await q('INSERT INTO seen_txs (tx_hash) VALUES ($1)', [txHash]); } catch { return; }
+
+  await q('UPDATE pending_payments SET verified=1 WHERE battle_id=$1 AND wallet=$2', [battleId, wallet]);
+  await q('UPDATE participants SET paid=1 WHERE battle_id=$1 AND wallet=$2', [battleId, wallet]);
+  console.log(`[watcher] Payment confirmed: battle=${battleId} wallet=${wallet}`);
+
+  const p = (await q('SELECT tg_user_id FROM participants WHERE battle_id=$1 AND wallet=$2', [battleId, wallet])).rows[0];
+  const b = (await q('SELECT * FROM battles WHERE id=$1', [battleId])).rows[0];
+  if (!b) return;
+
+  const paidCount = +(await q('SELECT COUNT(*) as c FROM participants WHERE battle_id=$1 AND paid=1', [battleId])).rows[0].c;
+  if (p?.tg_user_id) await sendTg(p.tg_user_id, `Ставка принята! Битва #${battleId}. Оплатили: ${paidCount}/${b.max_players}`);
+
+  if (paidCount >= b.max_players && b.status === 'open') {
+    const endsAt = Math.floor(Date.now() / 1000) + Math.floor(b.duration_ms / 1000);
+    await q("UPDATE battles SET status='live', started_at=$1, ends_at=$2 WHERE id=$3", [Math.floor(Date.now()/1000), endsAt, battleId]);
+    console.log(`[watcher] Battle ${battleId} started!`);
+    const prize = Math.round(b.stake * b.max_players * (1 - CONFIG.FEE_PERCENT / 100));
+    const parts = await q('SELECT tg_user_id FROM participants WHERE battle_id=$1 AND tg_user_id IS NOT NULL', [battleId]);
+    for (const part of parts.rows) {
+      await sendTg(part.tg_user_id, `🚀 Битва #${battleId} началась!\n\nБанк: ${(b.stake * b.max_players).toLocaleString()} SLUG\nПриз: ${prize.toLocaleString()} SLUG\n\nЧей портфель вырастет больше — забирает всё!`);
+    }
+  }
+}
+
+async function checkPayments() {
+  const pending = (await q('SELECT * FROM pending_payments WHERE verified=0')).rows;
+  if (!pending.length) return;
+
+  const now = Math.floor(Date.now() / 1000);
+  for (const p of pending) {
+    if (now - parseInt(p.created_at) < CONFIG.PAYMENT_TIMEOUT_SEC) continue;
+    await q('UPDATE pending_payments SET verified=2 WHERE id=$1', [p.id]);
+    await q('DELETE FROM participants WHERE battle_id=$1 AND wallet=$2 AND paid=0', [p.battle_id, p.wallet]);
+    const b = (await q('SELECT * FROM battles WHERE id=$1', [p.battle_id])).rows[0];
+    if (b) await q('UPDATE battles SET pool_total=$1 WHERE id=$2', [Math.max(0, parseInt(b.pool_total) - parseInt(b.stake)), p.battle_id]);
+  }
+
+  const active = pending.filter(p => now - parseInt(p.created_at) < CONFIG.PAYMENT_TIMEOUT_SEC);
+  if (!active.length) return;
+
+  for (const tx of await getRecentIncomingTxs()) {
+    const txHash = tx.txhash;
+    if (!txHash || (tx.code !== undefined && tx.code !== 0)) continue;
+    if ((await q('SELECT 1 FROM seen_txs WHERE tx_hash=$1', [txHash])).rows.length) continue;
+    const parsed = parseBattleMemo(tx.body?.memo || '');
+    if (!parsed) continue;
+    const pend = active.find(p => p.battle_id === parsed.battleId && p.wallet === parsed.wallet);
+    if (!pend) continue;
+    const paidAmount = extractTransferAmount(tx);
+    if (paidAmount !== null && paidAmount < parseInt(pend.amount)) continue;
+    await confirmPayment(parsed.battleId, parsed.wallet, txHash, paidAmount);
+  }
+}
+
+setInterval(checkPayments, 5000);
+
+// ── Middleware ────────────────────────────────────────────────
+function requireWallet(req, res, next) {
+  const wallet = req.headers['x-wallet'] || req.body?.wallet;
+  if (!wallet?.startsWith('axm1')) return res.status(401).json({ error: 'Axiome wallet required' });
+  req.wallet = wallet;
+  next();
+}
+
+function requireAdmin(req, res, next) {
+  if ((req.headers['x-admin-key'] || req.body?.admin_key) !== CONFIG.ADMIN_KEY)
+    return res.status(401).json({ error: 'Unauthorized' });
+  next();
+}
+
+// ── Routes ────────────────────────────────────────────────────
+app.get('/health', (_, res) => res.json({ ok: true, time: Date.now() }));
+
+app.get('/battles', async (req, res) => {
+  const battles = req.query.status
+    ? await q('SELECT * FROM battles WHERE status=$1 ORDER BY created_at DESC LIMIT 50', [req.query.status])
+    : await q('SELECT * FROM battles ORDER BY created_at DESC LIMIT 50');
+  const result = await Promise.all(battles.rows.map(async b => {
+    const [total, paid] = await Promise.all([
+      q('SELECT COUNT(*) as c FROM participants WHERE battle_id=$1', [b.id]),
+      q('SELECT COUNT(*) as c FROM participants WHERE battle_id=$1 AND paid=1', [b.id]),
+    ]);
+    return { ...b, participants_count: +total.rows[0].c, paid_count: +paid.rows[0].c };
+  }));
+  res.json(result);
+});
+
+app.get('/battles/:id', async (req, res) => {
+  const bRes = await q('SELECT * FROM battles WHERE id=$1', [req.params.id]);
+  if (!bRes.rows.length) return res.status(404).json({ error: 'Not found' });
+  const parts = await q('SELECT wallet,tg_username,joined_at,growth_pct,paid FROM participants WHERE battle_id=$1 ORDER BY growth_pct DESC', [req.params.id]);
+  res.json({ ...bRes.rows[0], participants: parts.rows });
+});
+
+app.post('/battles', requireWallet, async (req, res) => {
+  const { stake, max_players, duration_key, tg_user_id, tg_username } = req.body;
+  if (!stake || stake < CONFIG.MIN_STAKE) return res.status(400).json({ error: `Мин. ставка: ${CONFIG.MIN_STAKE} SLUG` });
+  if (!max_players || max_players < 2 || max_players > 50) return res.status(400).json({ error: 'Игроков: 2-50' });
+  const DURATIONS = { '1h': 3600000, '24h': 86400000, '3d': 259200000, '7d': 604800000 };
+  const duration_ms = DURATIONS[duration_key];
+  if (!duration_ms) return res.status(400).json({ error: 'Длительность: 1h|24h|3d|7d' });
+
+  const slugBal = await getCW20Balance(req.wallet, CONFIG.SLUG_CONTRACT);
+  if (slugBal < stake * 1e6) return res.status(400).json({ error: `Недостаточно SLUG. Нужно: ${stake}` });
+
+  const id      = crypto.randomBytes(4).toString('hex').toUpperCase();
+  const memo    = `BATTLE:${id}:${req.wallet}`;
+  const portfolio = await getFullPortfolio(req.wallet);
+  const prices    = await getTokenPrices();
+  const snap      = JSON.stringify({ tokens: portfolio, prices, total_usd: await calcPortfolioUsd(portfolio, prices), ts: Date.now() });
+
+  await q('INSERT INTO battles (id,creator,stake,max_players,duration_ms,status,pool_total) VALUES ($1,$2,$3,$4,$5,$6,0)', [id,req.wallet,stake,max_players,duration_ms,'open']);
+  await q('INSERT INTO participants (battle_id,wallet,tg_user_id,tg_username,portfolio_start) VALUES ($1,$2,$3,$4,$5)', [id,req.wallet,tg_user_id||null,tg_username||null,snap]);
+  await q('INSERT INTO pending_payments (battle_id,wallet,amount,memo) VALUES ($1,$2,$3,$4)', [id,req.wallet,stake*1e6,memo]);
+
+  res.json({ id, qr_string: buildJoinQR(id, stake, memo), memo, stake, message: `Битва #${id} создана!`, payment_timeout_sec: CONFIG.PAYMENT_TIMEOUT_SEC });
+});
+
+app.post('/battles/:id/join', requireWallet, async (req, res) => {
+  const { tg_user_id, tg_username } = req.body;
+  const b = (await q('SELECT * FROM battles WHERE id=$1', [req.params.id])).rows[0];
+  if (!b) return res.status(404).json({ error: 'Not found' });
+  if (b.status !== 'open') return res.status(400).json({ error: 'Битва не открыта' });
+
+  const paidCnt = +(await q('SELECT COUNT(*) as c FROM participants WHERE battle_id=$1 AND paid=1', [req.params.id])).rows[0].c;
+  if (paidCnt >= b.max_players) return res.status(400).json({ error: 'Битва заполнена' });
+
+  const exist = (await q('SELECT paid FROM participants WHERE battle_id=$1 AND wallet=$2', [req.params.id, req.wallet])).rows[0];
+  if (exist?.paid) return res.status(400).json({ error: 'Уже оплатил' });
+
+  const slugBal = await getCW20Balance(req.wallet, CONFIG.SLUG_CONTRACT);
+  if (slugBal < b.stake * 1e6) return res.status(400).json({ error: `Недостаточно SLUG. Нужно: ${b.stake}` });
+
+  const portfolio = await getFullPortfolio(req.wallet);
+  const prices    = await getTokenPrices();
+  const usdVal    = await calcPortfolioUsd(portfolio, prices);
+  const snap      = JSON.stringify({ tokens: portfolio, prices, total_usd: usdVal, ts: Date.now() });
+  const memo      = `BATTLE:${req.params.id}:${req.wallet}`;
+
+  try {
+    await q('INSERT INTO participants (battle_id,wallet,tg_user_id,tg_username,portfolio_start) VALUES ($1,$2,$3,$4,$5)', [req.params.id,req.wallet,tg_user_id||null,tg_username||null,snap]);
+  } catch (e) {
+    if (e.message.includes('unique') || e.message.includes('duplicate')) return res.status(400).json({ error: 'Уже участвуешь' });
+    throw e;
+  }
+  await q('INSERT INTO pending_payments (battle_id,wallet,amount,memo) VALUES ($1,$2,$3,$4) ON CONFLICT (memo) DO NOTHING', [req.params.id,req.wallet,b.stake*1e6,memo]);
+
+  res.json({ message: `Оплати ставку ${b.stake} SLUG`, qr_string: buildJoinQR(req.params.id, b.stake, memo), memo, stake: b.stake, portfolio_usd: usdVal.toFixed(2), payment_timeout_sec: CONFIG.PAYMENT_TIMEOUT_SEC });
+});
+
+app.get('/battles/:id/payment-status/:wallet', async (req, res) => {
+  const pRes = await q('SELECT paid FROM participants WHERE battle_id=$1 AND wallet=$2', [req.params.id, req.params.wallet]);
+  if (!pRes.rows.length) return res.status(404).json({ error: 'Not found' });
+  const pend = (await q('SELECT verified,created_at FROM pending_payments WHERE battle_id=$1 AND wallet=$2', [req.params.id, req.params.wallet])).rows[0];
+  const now  = Math.floor(Date.now() / 1000);
+  res.json({ paid: pRes.rows[0].paid === 1, expired: pend?.verified === 2, timeout_sec: Math.max(0, pend ? CONFIG.PAYMENT_TIMEOUT_SEC - (now - parseInt(pend.created_at)) : 0) });
+});
+
+app.post('/battles/:id/finalize', async (req, res) => {
+  const b = (await q('SELECT * FROM battles WHERE id=$1', [req.params.id])).rows[0];
+  if (!b) return res.status(404).json({ error: 'Not found' });
+  if (b.status !== 'live') return res.status(400).json({ error: 'Не активна' });
+
+  const now = Math.floor(Date.now() / 1000);
+  if (b.ends_at && now < parseInt(b.ends_at)) return res.status(400).json({ error: `Завершится через ${parseInt(b.ends_at)-now}с` });
+
+  const parts = (await q('SELECT * FROM participants WHERE battle_id=$1 AND paid=1', [req.params.id])).rows;
+  if (!parts.length) {
+    await q("UPDATE battles SET status='cancelled' WHERE id=$1", [req.params.id]);
+    return res.json({ message: 'Отменена — нет оплативших' });
+  }
+
+  const prices = await getTokenPrices();
+  let winner = null, bestGrowth = -Infinity;
+
+  for (const p of parts) {
+    const start  = JSON.parse(p.portfolio_start || '{}');
+    const cur    = await getFullPortfolio(p.wallet);
+    const curUsd = await calcPortfolioUsd(cur, prices);
+    const growth = (start.total_usd || 0) > 0 ? ((curUsd - start.total_usd) / start.total_usd) * 100 : 0;
+    await q('UPDATE participants SET portfolio_end=$1,growth_pct=$2 WHERE battle_id=$3 AND wallet=$4',
+      [JSON.stringify({ tokens: cur, prices, total_usd: curUsd, ts: Date.now() }), growth, b.id, p.wallet]);
+    if (growth > bestGrowth) { bestGrowth = growth; winner = p.wallet; }
+  }
+
+  const prize = Math.round(parseInt(b.stake) * parts.length * (1 - CONFIG.FEE_PERCENT / 100));
+  const fee   = Math.round(parseInt(b.stake) * parts.length * CONFIG.FEE_PERCENT / 100);
+
+  await q("UPDATE battles SET status='ended',winner=$1 WHERE id=$2", [winner, b.id]);
+  console.log(`[finalize] Battle ${b.id} ended. Winner: ${winner} prize=${prize}`);
+
+  if (CONFIG.ESCROW_CONTRACT) {
+    try { await callEscrowFinalize(b.id, winner); await notifyWinnerAuto(b, winner, prize); }
+    catch (e) { await notifyWinner(b, winner, prize); }
+  } else {
+    await notifyWinner(b, winner, prize);
+  }
+
+  for (const loser of parts.filter(p => p.wallet !== winner)) {
+    if (!loser.tg_user_id) continue;
+    await sendTg(loser.tg_user_id, `Битва #${b.id} завершена. Победитель: ${winner.slice(0,8)}... Твой результат: ${(parts.find(p=>p.wallet===loser.wallet)?.growth_pct||0).toFixed(2)}%`);
+  }
+
+  res.json({ winner, growth_pct: bestGrowth.toFixed(2), prize_slug: prize, fee_slug: fee, paid_players: parts.length });
+});
+
+app.get('/portfolio/:wallet', async (req, res) => {
+  if (!req.params.wallet.startsWith('axm1')) return res.status(400).json({ error: 'Invalid wallet' });
+  const [portfolio, prices] = await Promise.all([getFullPortfolio(req.params.wallet), getTokenPrices()]);
+  res.json({ wallet: req.params.wallet, portfolio, prices, total_usd: await calcPortfolioUsd(portfolio, prices) });
+});
+
+app.get('/admin/stats', requireAdmin, async (req, res) => {
+  const [o,l,e,c,pend,conf,exp,tot,paid] = await Promise.all([
+    q("SELECT COUNT(*) as c FROM battles WHERE status='open'"),
+    q("SELECT COUNT(*) as c FROM battles WHERE status='live'"),
+    q("SELECT COUNT(*) as c FROM battles WHERE status='ended'"),
+    q("SELECT COUNT(*) as c FROM battles WHERE status='cancelled'"),
+    q('SELECT COUNT(*) as c FROM pending_payments WHERE verified=0'),
+    q('SELECT COUNT(*) as c FROM pending_payments WHERE verified=1'),
+    q('SELECT COUNT(*) as c FROM pending_payments WHERE verified=2'),
+    q('SELECT COUNT(*) as c FROM participants'),
+    q('SELECT COUNT(*) as c FROM participants WHERE paid=1'),
+  ]);
+  res.json({
+    battles:      { open: +o.rows[0].c, live: +l.rows[0].c, ended: +e.rows[0].c, cancelled: +c.rows[0].c },
+    payments:     { pending: +pend.rows[0].c, confirmed: +conf.rows[0].c, expired: +exp.rows[0].c },
+    participants: { total: +tot.rows[0].c, paid: +paid.rows[0].c },
+  });
+});
+
+app.post(`/webhook/${CONFIG.BOT_TOKEN}`, async (req, res) => {
+  res.sendStatus(200);
+  const msg = req.body?.message;
+  if (!msg) return;
+  if (msg.text === '/start') {
+    await sendTg(msg.chat.id, `🐌 <b>CRYPTO PORTFOLIO BATTLE</b>\n\nСобери портфель и сражайся! Чей вырастет больше — забирает банк 🏆`,
+      { reply_markup: { inline_keyboard: [[{ text: '⚔️ Открыть игру', web_app: { url: CONFIG.FRONTEND_URL } }]] } });
+  }
+  if (msg.text === '/battles') {
+    const battles = await q("SELECT * FROM battles WHERE status IN ('open','live') ORDER BY created_at DESC LIMIT 5");
+    if (!battles.rows.length) { await sendTg(msg.chat.id, 'Активных битв нет.'); return; }
+    let txt = '⚔️ <b>Активные битвы:</b>\n\n';
+    for (const b of battles.rows) {
+      const cnt = await q('SELECT COUNT(*) as c FROM participants WHERE battle_id=$1 AND paid=1', [b.id]);
+      txt += `#${b.id} | ${b.stake} SLUG | ${cnt.rows[0].c}/${b.max_players} | ${b.status.toUpperCase()}\n`;
+    }
+    await sendTg(msg.chat.id, txt);
+  }
+});
+
+setInterval(async () => {
+  const now = Math.floor(Date.now() / 1000);
+  const exp = await q("SELECT id FROM battles WHERE status='live' AND ends_at<=$1", [now]);
+  for (const b of exp.rows) {
+    try { await fetch(`http://localhost:${CONFIG.PORT}/battles/${b.id}/finalize`, { method: 'POST' }); }
+    catch (e) { console.error('[auto-finalize]', e.message); }
+  }
+}, 5 * 60 * 1000);
+
+async function setWebhook(baseUrl) {
+  const res  = await fetch(`https://api.telegram.org/bot${CONFIG.BOT_TOKEN}/setWebhook?url=${encodeURIComponent(baseUrl+'/webhook/'+CONFIG.BOT_TOKEN)}`);
+  console.log('[tg] Webhook:', (await res.json()).ok ? 'OK' : 'failed');
+}
+
+async function start() {
+  await initDB();
+  app.listen(CONFIG.PORT, async () => {
+    console.log(`🐌 SLUG Battle Server v3 (PostgreSQL) on port ${CONFIG.PORT}`);
+    if (process.env.RAILWAY_STATIC_URL) await setWebhook(`https://${process.env.RAILWAY_STATIC_URL}`);
+  });
+}
+
+start().catch(e => { console.error('Failed to start:', e.message); process.exit(1); });
